@@ -8,7 +8,9 @@ from urllib.request import (
     urlopen,
 )
 import os, json
+from collections import deque
 
+from PyQt5.QtCore import QTimer
 from PyQt5.QtNetwork import QNetworkRequest
 
 from picard import config, log
@@ -47,6 +49,146 @@ PLUGIN_USER_GUIDE_URL = "https://github.com/izaz4141/picard-lrclib"
 
 lrclib_get_url = "https://lrclib.net/api/get"
 lrclib_search_url = "https://lrclib.net/api/search"
+
+# Request queue with throttling to prevent overwhelming Picard's webservice
+_request_queue = deque()
+_request_timer = None
+_is_processing = False
+
+# Minimum delay between requests to prevent Picard's webservice queue from dropping requests
+# Picard's webservice has a limited internal queue; firing too many requests at once causes drops
+MIN_REQUEST_DELAY_MS = 50  # 50ms = max 20 requests/second to Picard's queue
+
+# Adaptive backoff for 429 rate limiting from the server
+_current_delay_ms = MIN_REQUEST_DELAY_MS
+INITIAL_BACKOFF_MS = 1000  # Start with 1 second backoff on 429
+MAX_BACKOFF_MS = 30000  # Max 30 seconds backoff
+
+# Diagnostic counters
+_diag_requests_queued = 0
+_diag_requests_sent = 0
+_diag_responses_received = 0
+_diag_responses_success = 0
+_diag_responses_error = 0
+
+
+def _process_request_queue():
+    """Process the next request in the queue with throttling."""
+    global _is_processing, _request_timer, _diag_requests_sent
+
+    if not _request_queue:
+        # Queue is empty - check if we should wait for more or finish
+        # Wait a bit longer in case more requests are being queued
+        if _is_processing:
+            # Schedule one more check after a delay
+            _request_timer = QTimer()
+            _request_timer.setSingleShot(True)
+            _request_timer.timeout.connect(_finalize_queue_if_empty)
+            _request_timer.start(200)  # 200ms grace period for more requests
+        return
+
+    _is_processing = True
+    ws, url, callback, queryargs, retry_count = _request_queue.popleft()
+    _diag_requests_sent += 1
+
+    # Wrap callback to detect 429 responses
+    wrapped_callback = partial(
+        _handle_response_with_retry, ws, url, callback, queryargs, retry_count
+    )
+
+    ws.get_url(
+        url=url,
+        handler=wrapped_callback,
+        parse_response_type="json",
+        priority=False,
+        important=False,
+        queryargs=queryargs,
+        cacheloadcontrol=QNetworkRequest.PreferCache,
+    )
+
+    # Always schedule next check with throttle delay
+    _request_timer = QTimer()
+    _request_timer.setSingleShot(True)
+    _request_timer.timeout.connect(_process_request_queue)
+    _request_timer.start(_current_delay_ms)
+
+
+def _finalize_queue_if_empty():
+    """Called after grace period - finalize if queue is still empty."""
+    global _is_processing
+
+    if _request_queue:
+        # More items arrived during grace period - keep processing
+        _process_request_queue()
+    else:
+        # Queue is truly empty - finalize
+        _is_processing = False
+        log.info(
+            f"{PLUGIN_NAME}: Queue finished. Stats: "
+            f"queued={_diag_requests_queued}, sent={_diag_requests_sent}, "
+            f"responses={_diag_responses_received}, success={_diag_responses_success}, "
+            f"error={_diag_responses_error}"
+        )
+
+
+def _handle_response_with_retry(
+    ws, url, original_callback, queryargs, retry_count, response, reply, error
+):
+    """Intercept response to handle 429 rate limiting with retry."""
+    global _current_delay_ms, _diag_responses_received, _diag_responses_success, _diag_responses_error
+
+    _diag_responses_received += 1
+
+    # Check for 429 Too Many Requests
+    status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+
+    # Log non-200 status codes for debugging
+    if status_code and status_code != 200:
+        log.debug(
+            f"{PLUGIN_NAME}: HTTP {status_code} for {queryargs.get('track_name', 'unknown')}"
+        )
+
+    if status_code == 429:
+        if retry_count < 3:  # Max 3 retries
+            # Calculate backoff delay with exponential increase
+            backoff_ms = min(INITIAL_BACKOFF_MS * (2**retry_count), MAX_BACKOFF_MS)
+            _current_delay_ms = backoff_ms
+
+            log.warning(
+                f"{PLUGIN_NAME}: Rate limited (429), retrying in {backoff_ms}ms "
+                f"(attempt {retry_count + 1}/3)"
+            )
+
+            # Re-queue the request with incremented retry count
+            _request_queue.appendleft(
+                (ws, url, original_callback, queryargs, retry_count + 1)
+            )
+
+            # Schedule retry after backoff
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(_process_request_queue)
+            timer.start(backoff_ms)
+        else:
+            _diag_responses_error += 1
+            log.error(f"{PLUGIN_NAME}: Rate limited, max retries exceeded for {url}")
+            # Call original callback with error so album loading can finalize
+            original_callback(response, reply, True)
+    else:
+        # Track success/error
+        if error or (
+            response and isinstance(response, dict) and not response.get("id")
+        ):
+            _diag_responses_error += 1
+        else:
+            _diag_responses_success += 1
+
+        # Success - reduce delay gradually back to minimum (but never below)
+        if _current_delay_ms > MIN_REQUEST_DELAY_MS:
+            _current_delay_ms = max(MIN_REQUEST_DELAY_MS, _current_delay_ms - 100)
+
+        # Call the original callback
+        original_callback(response, reply, error)
 
 
 def format_durasi(durasi: int) -> str:
@@ -203,18 +345,30 @@ def show_search_table(parent, query, response, request_callback):
 
 
 def _request(ws, url, callback, queryargs=None, important=False):
+    """Queue a request with throttling to prevent overwhelming Picard's webservice."""
+    global _is_processing, _diag_requests_queued
+    global _diag_requests_sent, _diag_responses_received, _diag_responses_success, _diag_responses_error
+
     if not queryargs:
         queryargs = {}
 
-    ws.get_url(
-        url=url,
-        handler=callback,
-        parse_response_type="json",
-        priority=True,
-        important=important,
-        queryargs=queryargs,
-        cacheloadcontrol=QNetworkRequest.PreferCache,
-    )
+    # Reset counters and log when starting a truly new batch
+    is_new_batch = not _request_queue and not _is_processing
+    if is_new_batch:
+        _diag_requests_queued = 0
+        _diag_requests_sent = 0
+        _diag_responses_received = 0
+        _diag_responses_success = 0
+        _diag_responses_error = 0
+        log.info(f"{PLUGIN_NAME}: Starting new lyrics fetch batch...")
+
+    # Add request to queue with retry_count=0
+    _request_queue.append((ws, url, callback, queryargs, 0))
+    _diag_requests_queued += 1
+
+    # Start processing if not already running
+    if not _is_processing:
+        _process_request_queue()
 
 
 def _fetch_json(url, params):
@@ -243,7 +397,7 @@ def get_lyrics(method, album, metadata, linked_files, length=None):
     artist = metadata["artist"]
     title = metadata["title"]
     albumName = metadata["album"]
-    duration = int(length)
+    duration = int(length) if length else 0
     if not (artist and title and albumName and duration):
         log.debug(
             "{}: artist, title, album name, and duration are required to obtain lyrics".format(
