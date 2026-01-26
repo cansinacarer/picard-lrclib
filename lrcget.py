@@ -1,3 +1,6 @@
+import json
+import os
+from collections import deque
 from functools import partial
 from urllib.parse import (
     quote,
@@ -7,28 +10,24 @@ from urllib.request import (
     Request,
     urlopen,
 )
-import os, json
-from collections import deque
-
-from PyQt5.QtCore import QTimer
-from PyQt5.QtNetwork import QNetworkRequest
 
 from picard import config, log
+from picard.album import Album
+from picard.config import BoolOption
 from picard.file import register_file_post_addition_to_track_processor
 from picard.track import Track
-from picard.album import Album
 from picard.ui.itemviews import (
     BaseAction,
-    register_track_action,
     register_album_action,
+    register_track_action,
 )
-
-from PyQt5 import QtWidgets
 from picard.ui.options import (
     OptionsPage,
     register_options_page,
 )
-from picard.config import BoolOption
+from PyQt5 import QtWidgets
+from PyQt5.QtCore import QTimer
+from PyQt5.QtNetwork import QNetworkRequest
 
 PLUGIN_NAME = "LRCLIB Lyrics"
 PLUGIN_AUTHOR = "Glicole"
@@ -135,7 +134,11 @@ def _handle_response_with_retry(
     ws, url, original_callback, queryargs, retry_count, response, reply, error
 ):
     """Intercept response to handle 429 rate limiting with retry."""
-    global _current_delay_ms, _diag_responses_received, _diag_responses_success, _diag_responses_error
+    global \
+        _current_delay_ms, \
+        _diag_responses_received, \
+        _diag_responses_success, \
+        _diag_responses_error
 
     _diag_responses_received += 1
 
@@ -347,7 +350,11 @@ def show_search_table(parent, query, response, request_callback):
 def _request(ws, url, callback, queryargs=None, important=False):
     """Queue a request with throttling to prevent overwhelming Picard's webservice."""
     global _is_processing, _diag_requests_queued
-    global _diag_requests_sent, _diag_responses_received, _diag_responses_success, _diag_responses_error
+    global \
+        _diag_requests_sent, \
+        _diag_responses_received, \
+        _diag_responses_success, \
+        _diag_responses_error
 
     if not queryargs:
         queryargs = {}
@@ -521,12 +528,11 @@ def process_response(method, album, metadata, linked_files, response, reply, err
                 or has_metadata_lyrics
                 and not config.setting["save_lrc_file"]
             ) and not config.setting["auto_overwrite"]:
-
                 if method == "search_on_load":
                     return
                 else:
                     title = "Overwrite file lyrics?"
-                    desc = ('Overwrite Lyrics for "{}".\n\n' "{}").format(
+                    desc = ('Overwrite Lyrics for "{}".\n\n{}').format(
                         file.metadata.get("title", "<file>"),
                         truncate_text(lyrics, 5, 42),
                     )
@@ -570,7 +576,6 @@ def process_response(method, album, metadata, linked_files, response, reply, err
 
 
 class LrclibLyricsOptionsPage(OptionsPage):
-
     NAME = "lrclib_lyrics"
     TITLE = "LRCLIB Lyrics"
     PARENT = "plugins"
@@ -748,7 +753,7 @@ class LrclibLyricsOptionsPage(OptionsPage):
 
                     audio_file_exists = False
                     for ext in self.AUDIO_EXTENSIONS:
-                        audio_path = os.path.join(dirpath, base_name + ext)
+                        audio_path = os.path.join(dirpath, f"{base_name}.{ext}")
                         if os.path.exists(audio_path):
                             audio_file_exists = True
                             break
